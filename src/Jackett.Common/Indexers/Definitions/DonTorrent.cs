@@ -4,6 +4,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Linq;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -14,6 +15,8 @@ using Jackett.Common.Models;
 using Jackett.Common.Models.IndexerConfig;
 using Jackett.Common.Services.Interfaces;
 using Jackett.Common.Utils;
+using Jackett.Common.Utils.Clients;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using NLog;
 using static Jackett.Common.Models.IndexerConfig.ConfigurationData;
@@ -38,7 +41,6 @@ namespace Jackett.Common.Indexers.Definitions
         };
         public override string[] LegacySiteLinks => new[]
         {
-            "https://dontorrent.ch/", // parking page with JavaScript redirect
             "https://dontorrent.haus/",
             "https://dontorrent.news/",
             "https://dontorrent.institute/",
@@ -79,7 +81,7 @@ namespace Jackett.Common.Indexers.Definitions
         }
 
         private const string NewTorrentsUrl = "ultimos";
-        private const string SearchUrl = "buscar/";
+        private const string SearchUrl = "buscar";
 
         private static Dictionary<string, string> CategoriesMap => new Dictionary<string, string>
             {
@@ -168,9 +170,19 @@ namespace Jackett.Common.Indexers.Definitions
                 return await base.Download(link);
             }
 
+            // per-episode content id is passed through as a marker query param (see ParseSeriesRelease),
+            // since one series/season detail page hosts a separate protected-download button per episode
+            string episodeContentId = null;
+            var markerIdx = downloadUrl.IndexOf("?dtcid=", StringComparison.OrdinalIgnoreCase);
+            if (markerIdx >= 0)
+            {
+                episodeContentId = downloadUrl.Substring(markerIdx + "?dtcid=".Length);
+                downloadUrl = downloadUrl.Substring(0, markerIdx);
+            }
+
             var parser = new HtmlParser();
 
-            // Eg https://dontorrent.li/pelicula/24797/Halloween-Kills
+            // Eg https://dontorrent.moi/pelicula/31040/Las-catadoras-del-Hitler
             var result = await RequestWithCookiesAsync(downloadUrl);
             if (result.Status != HttpStatusCode.OK)
                 throw new ExceptionWithConfigData(result.ContentString, configData);
@@ -179,13 +191,87 @@ namespace Jackett.Common.Indexers.Definitions
             //var info = dom.QuerySelectorAll("div.descargar > div.card > div.card-body").First();
             //var title = info.QuerySelector("h2.descargarTitulo").TextContent;
 
-            var dlStr = dom.QuerySelector("div.text-center > p > a");
+            // site switched from plain download links to a Proof-of-Work gated "protected-download" button
+            var protectedBtn = string.IsNullOrWhiteSpace(episodeContentId)
+                ? dom.QuerySelector("a.protected-download")
+                : dom.QuerySelector($"a.protected-download[data-content-id='{episodeContentId}']");
 
-            //dl site starts with "//cdn.pizza" and they accept https so use it
-            downloadUrl = dlStr != null ? string.Format("https:{0}", dlStr.GetAttribute("href")) : "";
+            if (protectedBtn != null)
+            {
+                var contentId = protectedBtn.GetAttribute("data-content-id");
+                var tabla = protectedBtn.GetAttribute("data-tabla");
+                downloadUrl = await ResolveProtectedDownloadAsync(contentId, tabla);
+            }
+            else
+            {
+                // legacy layout fallback, in case the site reverts or some pages still use it
+                var dlStr = dom.QuerySelector("div.text-center > p > a");
+
+                //dl site starts with "//cdn.pizza" and they accept https so use it
+                downloadUrl = dlStr != null ? string.Format("https:{0}", dlStr.GetAttribute("href")) : "";
+            }
+
+            if (downloadUrl.IsNullOrWhiteSpace())
+                throw new Exception("DonTorrent: could not resolve a download link for this release (site layout may have changed again).");
 
             var content = await base.Download(new Uri(downloadUrl));
             return content;
+        }
+
+        // DonTorrent gates every download behind a small client-side Proof-of-Work challenge
+        // (see /assets/js/don_download.js): generate a challenge, brute-force a nonce whose
+        // sha256(challenge + nonce) has `difficulty` leading zero hex chars, then validate it
+        // to get back the real download URL. The site can also reply with a rate-limit (429) or
+        // an interactive CAPTCHA, neither of which an automated indexer can satisfy.
+        private async Task<string> ResolveProtectedDownloadAsync(string contentId, string tabla)
+        {
+            if (contentId.IsNullOrWhiteSpace() || tabla.IsNullOrWhiteSpace())
+                throw new Exception("DonTorrent: could not find download button data (site layout may have changed again).");
+
+            var powUrl = SiteLink + "api_validate_pow.php";
+            var jsonHeaders = new Dictionary<string, string> { { "Content-Type", "application/json" } };
+
+            var generateBody = JsonConvert.SerializeObject(new { action = "generate", content_id = int.Parse(contentId), tabla });
+            var generateResult = await RequestWithCookiesAsync(powUrl, method: RequestType.POST, referer: SiteLink, headers: jsonHeaders, rawbody: generateBody);
+            var generateJson = JObject.Parse(generateResult.ContentString);
+            if (generateJson.Value<bool?>("success") != true)
+                throw new Exception($"DonTorrent: PoW challenge generation failed: {generateJson.Value<string>("error") ?? generateResult.ContentString}");
+
+            var challenge = generateJson.Value<string>("challenge");
+            var nonce = ComputeProofOfWork(challenge, 3);
+
+            var validateBody = JsonConvert.SerializeObject(new { action = "validate", challenge, nonce });
+            var validateResult = await RequestWithCookiesAsync(powUrl, method: RequestType.POST, referer: SiteLink, headers: jsonHeaders, rawbody: validateBody);
+            var validateJson = JObject.Parse(validateResult.ContentString);
+
+            if ((int)validateResult.Status == 429 || validateJson.Value<string>("status") == "limit_exceeded")
+                throw new Exception("DonTorrent: hourly download limit reached on this indexer (site-side rate limit), try again later.");
+
+            if (validateJson.Value<string>("status") == "captcha_required")
+                throw new Exception("DonTorrent: site is requesting a CAPTCHA to continue; automated downloads can't solve this - wait a while and retry.");
+
+            if (validateJson.Value<bool?>("success") != true)
+                throw new Exception($"DonTorrent: PoW validation failed: {validateJson.Value<string>("error") ?? validateResult.ContentString}");
+
+            var downloadUrl = validateJson.Value<string>("download_url");
+            if (downloadUrl.IsNullOrWhiteSpace())
+                throw new Exception("DonTorrent: site did not return a download URL after solving the challenge.");
+
+            return downloadUrl;
+        }
+
+        private static long ComputeProofOfWork(string challenge, int difficulty)
+        {
+            var target = new string('0', difficulty);
+            using var sha256 = SHA256.Create();
+            for (long nonce = 0; ; nonce++)
+            {
+                var bytes = Encoding.UTF8.GetBytes(challenge + nonce);
+                var hash = sha256.ComputeHash(bytes);
+                var hex = Convert.ToHexString(hash).ToLowerInvariant();
+                if (hex.StartsWith(target, StringComparison.Ordinal))
+                    return nonce;
+            }
         }
 
         private async Task<List<ReleaseInfo>> PerformQueryNewest(TorznabQuery query)
@@ -286,8 +372,11 @@ namespace Jackett.Common.Indexers.Definitions
         {
             var releases = new List<ReleaseInfo>();
             var searchTerm = query.SearchTerm;
-            var url = SiteLink + SearchUrl + searchTerm;
-            var result = await RequestWithCookiesAsync(url, referer: url);
+
+            // site replaced the old GET /buscar/{term} route with a POST form (single "valor" field)
+            var url = SiteLink + SearchUrl;
+            var body = new Dictionary<string, string> { { "valor", searchTerm } };
+            var result = await RequestWithCookiesAsync(url, referer: url, data: body, method: RequestType.POST);
             if (result.Status != HttpStatusCode.OK)
                 throw new ExceptionWithConfigData(result.ContentString, configData);
 
@@ -296,28 +385,28 @@ namespace Jackett.Common.Indexers.Definitions
                 var searchResultParser = new HtmlParser();
                 using var doc = await searchResultParser.ParseDocumentAsync(result.ContentString);
 
-                var rows = doc.QuerySelectorAll("div.seccion#buscador > div.card > div.card-body > p");
+                // the "Has realizado..."/"Se han encontrado..." summary lines are the only <p class="lead">
+                // in the results container - every other <p> here is one result row
+                var rows = doc.QuerySelectorAll("div.seccion#buscador > div.card > div.card-body > p")
+                              .Where(row => !row.ClassList.Contains("lead"));
 
-                if (rows.First().TextContent.Contains("Introduce alguna palabra para buscar con al menos 2 letras."))
+                foreach (var row in rows)
                 {
-                    return releases; //no enough search terms
-                }
+                    var anchor = row.QuerySelector("a");
+                    var href = anchor?.GetAttribute("href");
+                    if (href.IsNullOrWhiteSpace())
+                        continue;
 
-                foreach (var row in rows.Skip(2))
-                {
                     //href=/pelicula/6981/Saga-Spiderman
-                    var link = string.Format("{0}{1}", SiteLink.TrimEnd('/'), row.QuerySelector("p > span > a").GetAttribute("href"));
-                    var title = row.QuerySelector("p > span > a").TextContent;
+                    var link = href.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                        ? href
+                        : SiteLink.TrimEnd('/') + href;
+                    var title = anchor.TextContent.Trim();
                     var cat = GetCategory(title, link);
-                    var quality = "";
 
-                    switch (GetCategoryFromURL(link))
-                    {
-                        case "pelicula":
-                        case "serie":
-                            quality = Regex.Replace(row.QuerySelector("p > span > span").TextContent, "([()])", "");
-                            break;
-                    }
+                    // eg row text "Matrix [4K] (4K)Película" -> quality = "4K"
+                    var qualityMatch = Regex.Match(row.TextContent, @"\(([^()]+)\)");
+                    var quality = qualityMatch.Success ? qualityMatch.Groups[1].Value : "";
 
                     switch (cat)
                     {
@@ -427,7 +516,15 @@ namespace Jackett.Common.Indexers.Definitions
                 var episodeData = row.QuerySelectorAll("td");
 
                 var episodeTitle = episodeData[0].TextContent; //it may contain two episodes divided by '&', eg '1x01 & 1x02'
-                var downloadLink = "https:" + episodeData[1].QuerySelector("a").GetAttribute("href"); // URL like "//cdn.pizza/"
+
+                // the site gates every download behind a per-episode Proof-of-Work challenge now
+                // (see Download()), so we can no longer resolve a direct link at listing time -
+                // defer resolution, tagging which episode's button to use on the shared season page
+                var downloadAnchor = episodeData[1].QuerySelector("a");
+                var episodeContentId = downloadAnchor?.GetAttribute("data-content-id");
+                var downloadLink = episodeContentId.IsNotNullOrWhiteSpace()
+                    ? link + "?dtcid=" + episodeContentId
+                    : "https:" + downloadAnchor?.GetAttribute("href"); // legacy protocol-relative href, eg "//cdn.pizza/"
                 var episodePublishStr = episodeData[2].TextContent;
                 var episodePublish = TryToParseDate(episodePublishStr, DateTime.Now);
 
