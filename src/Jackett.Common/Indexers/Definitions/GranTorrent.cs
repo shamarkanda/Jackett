@@ -52,11 +52,6 @@ namespace Jackett.Common.Indexers.Definitions
 
         private string SearchUrl => SiteLink.TrimEnd('/') + "/wp-admin/admin-ajax.php";
 
-        // The site's own pages still embed torrent links on the retired "wf" CDN subdomain
-        // (NXDOMAIN) instead of the current "lol" one. Rewrite before downloading.
-        private const string CurrentTorrentCdnHost = "dl.grantorrent.lol";
-        private static readonly Regex StaleTorrentCdnHost = new Regex(@"dl\.grantorrent\.\w+", RegexOptions.IgnoreCase);
-
         private static Dictionary<string, long> EstimatedSizeByCategory => new Dictionary<string, long>
         {
             { GranTorrentCatType.Pelicula, 2.Gigabytes() },
@@ -82,9 +77,6 @@ namespace Jackett.Common.Indexers.Definitions
             // Avoid Cloudflare too many requests limiter
             webclient.requestDelay = 2.1;
             webclient.EmulateBrowser = false;
-            // dl.grantorrent.lol doesn't send its intermediate cert, so .NET can't build the chain; pin the leaf instead.
-            // Re-pin when this expires (~2027-01-05) or the CDN rotates subdomain again.
-            webclient.AddTrustedCertificate(CurrentTorrentCdnHost, "A915ECDAF02A0B163AF09002E446F7D407CD26AD");
         }
 
         private static TorznabCapabilities SetCapabilities()
@@ -397,7 +389,7 @@ namespace Jackett.Common.Indexers.Definitions
 
         public override async Task<byte[]> Download(Uri link)
         {
-            var linkStr = StaleTorrentCdnHost.Replace(link.ToString(), CurrentTorrentCdnHost);
+            var linkStr = link.ToString();
 
             // If the link is a direct torrent URL (from data-src), download directly
             if (linkStr.Contains(".torrent"))
